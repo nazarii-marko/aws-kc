@@ -1,0 +1,209 @@
+service: serviceName
+plugins:
+  - serverless-offline
+  - serverless-webpack
+  - serverless-dotenv-plugin
+  - serverless-plugin-scripts
+custom:
+  serverless-offline:
+    useChildProcesses: true
+  webpack:
+    webpackConfig: ./webpack.config.js
+    keepOutputDirectory: true
+    packagerOptions:
+      scripts:
+        - prisma generate
+    includeModules: true
+package:
+  individually: true
+provider:
+  name: aws
+  runtime: nodejs14.x
+  region: eu-central-1
+  httpApi:
+    cors:
+      allowedOrigins:
+        - ${env:HOST_URL}
+      allowCredentials: true
+      allowedHeaders:
+        - content-type
+        - authorization
+        - cookies
+      allowedMethods:
+        - GET
+        - POST
+      exposedResponseHeaders:
+        - set-cookie
+  stage: qwerty
+  environment:
+    BUCKET_NAME: !Ref s3Bucket #Will be useful for sdk
+    S3_URL: !GetAtt s3Bucket.DomainName
+    DATABASE_URL: !Join
+      - ''
+      - - 'postgresql://'
+        - ${self:resources.Resources.rdsPostgres.Properties.MasterUsername}
+        - ':'
+        - ${self:resources.Resources.rdsPostgres.Properties.MasterUserPassword}
+        - '@'
+        - !GetAtt rdsPostgres.Endpoint.Address
+        - ':5432/poc'
+  iam:
+    role:
+      statements:
+        # Allow access to RDS from all resources in VPC
+        - Effect: Allow
+          Action:
+            - rds:*
+          Resource: 'arn:aws:rds:eu-central-1:*:*'
+        # Allow access to S3 from all resources in VPC
+        - Effect: Allow
+          Action:
+            - s3:*
+          Resource: 'arn:aws:s3:::*'
+  lambdaHashingVersion: 20201221
+useDotenv: true
+functions:
+  graphql:
+    handler: src/index.handler
+    vpc:
+      securityGroupIds:
+        - !Ref lambdaSg
+      subnetIds:
+        - !Ref lambdaRdsPrivateSnA
+    events:
+      # there are different events - httpApi & http; httpApi is newer and easier to configure CORS
+      - httpApi:
+          path: /graphql
+          method: GET
+      - httpApi:
+          path: /graphql
+          method: POST
+      - httpApi:
+          path: /health
+          method: GET
+resources:
+  Resources:
+    # Resource is always structured this way:
+    # Name (will be displayed in CloudFormation stack in AWS Console)
+    #   Type (can be found in docs for each available resource)
+    #   Properties (different for each resource)
+    s3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        AccessControl: PublicRead
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+              AllowedOrigins:
+                - '*'
+              Id: corsRuleAllowAllGet
+    rdsPostgres:
+      Type: AWS::RDS::DBInstance
+      Properties:
+        MasterUsername: ${env:RDS_MASTER_USERNAME}
+        MasterUserPassword: ${env:RDS_MASTER_PASSWORD}
+        AllocatedStorage: 20
+        DBName: poc
+        DBInstanceClass: db.t2.micro
+        VPCSecurityGroups:
+          - !GetAtt rdsSg.GroupId
+        DBSubnetGroupName:
+          Ref: rdsSnG
+        Engine: postgres
+        EngineVersion: 12.7
+        PubliclyAccessible: false
+    # VPC Section:
+    # VPC
+    #   Subnet Group (required for RDS)
+    #     SubnetA
+    #     SubnetB
+    #   rds Sec group
+    #     ingress/egress rules
+    #   lambda sec group
+    #     ingress/egress rules
+    lambdaSgEgress:
+      Type: AWS::EC2::SecurityGroupEgress
+      Properties:
+        IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+        GroupId:
+          Fn::GetAtt:
+            - lambdaSg
+            - GroupId
+    lambraSgIngress:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        GroupId:
+          Fn::GetAtt:
+            - lambdaSg
+            - GroupId
+    rdsSgEgress:
+      Type: AWS::EC2::SecurityGroupEgress
+      Properties:
+        IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+        GroupId:
+          Fn::GetAtt:
+            - rdsSg
+            - GroupId
+    rdsSgIngress:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        GroupId:
+          Fn::GetAtt:
+            - rdsSg
+            - GroupId
+        SourceSecurityGroupId:
+          Fn::GetAtt:
+            - lambdaSg
+            - GroupId
+    rdsSg:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: rds security group
+        VpcId:
+          Ref: lambdaRdsVpc
+    rdsSnG:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: 'RDS Subnet Group'
+        SubnetIds:
+          - Ref: lambdaRdsPrivateSnA
+          - Ref: lambdaRdsPrivateSnB
+    lambdaRdsPrivateSnA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: eu-central-1a
+        CidrBlock: 10.10.12.0/24
+        VpcId: !Ref lambdaRdsVpc
+        MapPublicIpOnLaunch: false
+    lambdaRdsPrivateSnB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: eu-central-1b
+        CidrBlock: 10.10.13.0/24
+        VpcId: !Ref lambdaRdsVpc
+        MapPublicIpOnLaunch: false
+    lambdaSg:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: lambda security group
+        VpcId:
+          Ref: lambdaRdsVpc
+    lambdaRdsVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.10.0.0/16
